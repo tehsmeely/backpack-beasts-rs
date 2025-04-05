@@ -140,10 +140,12 @@ impl INode2D for BattleCoordinator {
         godot_print!("Ready");
         self.populate_menu();
     }
+    /*
     fn enter_tree(&mut self) {
         godot_print!("Entered Tree");
         self.populate_menu();
     }
+    */
 }
 
 #[godot_api]
@@ -160,20 +162,8 @@ impl BattleCoordinator {
     }
 
     #[func]
-    fn on_attack_opt0_pressed(&mut self) {
-        self.handle_attack(0);
-    }
-    #[func]
-    fn on_attack_opt1_pressed(&mut self) {
-        self.handle_attack(1);
-    }
-    #[func]
-    fn on_attack_opt2_pressed(&mut self) {
-        self.handle_attack(2);
-    }
-    #[func]
-    fn on_attack_opt3_pressed(&mut self) {
-        self.handle_attack(3);
+    fn on_attack_option_pressed(&mut self, attack_resource: Gd<BeastAttack>) {
+        self.handle_attack(BeastOwner::Player, BeastOwner::Enemy, attack_resource);
     }
 }
 
@@ -187,53 +177,108 @@ impl BattleCoordinator {
             child.queue_free();
         }
 
-        match self.menu_state {
-            MenuState::Base => {
-                let mut attack_button = Button::new_alloc();
-                attack_button.set_text("Attack");
-                menu_base.add_child(&attack_button);
-                attack_button.connect("pressed", &base.callable("on_attack_pressed"));
-                let mut flee_button = Button::new_alloc();
-                flee_button.set_text("Flee");
-                menu_base.add_child(&flee_button);
-                flee_button.connect("pressed", &base.callable("on_flee_pressed"));
-            }
-            MenuState::AttackChoice => {
-                for i in 0..4 {
+        match self.turn_state {
+            TurnState::PlayerTurn => match self.menu_state {
+                MenuState::Base => {
                     let mut attack_button = Button::new_alloc();
-                    attack_button.set_text(&format!("Attack {}", i));
+                    attack_button.set_text("Attack");
                     menu_base.add_child(&attack_button);
-                    attack_button.connect(
-                        "pressed",
-                        &base.callable(&format!("on_attack_opt{}_pressed", i)),
-                    );
+                    attack_button.connect("pressed", &base.callable("on_attack_pressed"));
+                    let mut flee_button = Button::new_alloc();
+                    flee_button.set_text("Flee");
+                    menu_base.add_child(&flee_button);
+                    flee_button.connect("pressed", &base.callable("on_flee_pressed"));
                 }
+                MenuState::AttackChoice => {
+                    let attacks = self
+                        .player_beast
+                        .as_ref()
+                        .unwrap()
+                        .clone()
+                        .cast::<Beast>()
+                        .bind()
+                        .attacks
+                        .clone();
+                    for (_i, attack) in attacks.iter_shared().enumerate() {
+                        let mut attack_button = Button::new_alloc();
+                        attack_button.set_text(&attack.bind().name);
+                        menu_base.add_child(&attack_button);
+                        attack_button.connect(
+                            "pressed",
+                            &base
+                                .callable(&format!("on_attack_option_pressed"))
+                                .bindv(&array![&attack.clone().to_variant()]),
+                        );
+                    }
+                }
+            },
+            TurnState::EnemyTurn => {
+                godot_print!("Enemy's turn");
             }
         }
     }
 
-    fn handle_attack(&mut self, attack_index: i64) {
-        godot_print!("Handling attack {}", attack_index);
-        if let Some(enemy_beast) = self.enemy_beast.as_mut() {
-            enemy_beast
-                .clone()
-                .cast::<Beast>()
-                .bind_mut()
-                .change_health(-10.0);
+    fn handle_attack(
+        &mut self,
+        attacker: BeastOwner,
+        attackee: BeastOwner,
+        attack_resource: Gd<BeastAttack>,
+    ) {
+        godot_print!(
+            "Handling attack {:?}->{:?} ({})",
+            attacker,
+            attackee,
+            attack_resource.bind().name
+        );
+        let target_beast = match attackee {
+            BeastOwner::Player => self.player_beast.as_mut(),
+            BeastOwner::Enemy => self.enemy_beast.as_mut(),
+        };
+        if let Some(target_beast) = target_beast {
+            let mut target_beast = target_beast.clone().cast::<Beast>();
+
+            let target_beast_type: BeastType = target_beast.bind().type_;
+            let type_modifier =
+                target_beast_type.modifier_when_receiving(attack_resource.bind().type_);
+            // TODO: Include level modifiers
+            let damage = attack_resource.bind().strength * type_modifier;
+            godot_print!(
+                "Dealing {} damage from {:?} to {:?}",
+                damage,
+                attacker,
+                attackee
+            );
+            target_beast.bind_mut().change_health(-1.0 * damage);
         }
         self.menu_state = MenuState::Base;
         self.populate_menu();
     }
 }
 
-#[derive(GodotConvert, Var, Export, Default)]
+#[derive(GodotConvert, Var, Export, Default, Debug, Clone, Copy)]
 #[godot(via = GString)]
 pub enum BeastType {
     #[default]
+    Basic,
     Earth,
     Wind,
     Fire,
     Water,
+}
+
+impl BeastType {
+    fn modifier_when_receiving(&self, attacker: BeastType) -> f64 {
+        match (self, attacker) {
+            (_, BeastType::Basic) => 0.9,
+            (BeastType::Earth, BeastType::Wind) => 0.5,
+            (BeastType::Earth, BeastType::Fire) => 2.0,
+            (BeastType::Wind, BeastType::Fire) => 0.5,
+            (BeastType::Wind, BeastType::Earth) => 2.0,
+            (BeastType::Fire, BeastType::Earth) => 0.5,
+            (BeastType::Fire, BeastType::Wind) => 2.0,
+            _ => 1.0,
+        }
+    }
 }
 
 #[derive(GodotClass)]
@@ -243,6 +288,10 @@ struct Beast {
     max_health: f64,
     #[export]
     type_: BeastType,
+    #[export]
+    name: GString,
+    #[export]
+    attacks: Array<Gd<BeastAttack>>,
     health: f64,
     base: Base<Node2D>,
 }
@@ -252,6 +301,12 @@ impl INode2D for Beast {
     fn ready(&mut self) {
         self.health = self.max_health;
         self.on_change_health();
+        let mut nametag = self
+            .base_mut()
+            .find_child("NameTag")
+            .unwrap()
+            .cast::<godot::classes::Label>();
+        nametag.set_text(&self.name);
     }
 }
 
@@ -266,9 +321,13 @@ impl Beast {
         if self.health <= 0.0 {
             // TODO: Handle death
             self.base_mut().queue_free();
+            self.base_mut().emit_signal("died", &[]);
         }
         self.on_change_health();
     }
+
+    #[signal]
+    fn died(&self);
 }
 
 impl Beast {
@@ -277,4 +336,16 @@ impl Beast {
         bar.set("value", &Variant::from(self.health));
         bar.set("max_value", &Variant::from(self.max_health));
     }
+}
+
+#[derive(GodotClass)]
+#[class(tool, init, base=Resource)]
+struct BeastAttack {
+    #[export]
+    name: GString,
+    #[export]
+    type_: BeastType,
+    #[export]
+    strength: f64,
+    base: Base<Resource>,
 }
